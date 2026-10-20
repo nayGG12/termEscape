@@ -1,186 +1,109 @@
-\
 name: Build termEscape (IPA + APK)
 
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches:
+      - main
 
 permissions:
   contents: read
 
-concurrency:
-  group: termescape-mobile-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
-  prepare:
-    name: Inspect project
+  build-android:
+    name: Build Android APK
     runs-on: ubuntu-latest
-    outputs:
-      package_manager: ${{ steps.detect.outputs.package_manager }}
-      web_dir: ${{ steps.detect.outputs.web_dir }}
-      has_lock: ${{ steps.detect.outputs.has_lock }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Print runner and repository information
+      - name: Show environment diagnostics
         shell: bash
         run: |
           set -euxo pipefail
-          echo "=== Repository diagnostics ==="
+          echo "=== Android diagnostics ==="
           echo "Repository: $GITHUB_REPOSITORY"
-          echo "Ref: $GITHUB_REF"
           echo "Commit: $GITHUB_SHA"
-          echo "Runner OS: $RUNNER_OS"
-          echo "Workspace: $GITHUB_WORKSPACE"
-          echo "Node/npm versions will be printed in platform jobs."
-          echo "Top-level files:"
+          uname -a
+          df -h
+          node --version || true
+          npm --version || true
+          java -version || true
+          echo "Root files:"
           ls -la
-          echo "Project manifests:"
-          find . -maxdepth 2 \( -name package.json -o -name vite.config.\* -o -name capacitor.config.\* -o -name package-lock.json -o -name pnpm-lock.yaml -o -name yarn.lock \) -print
-
-      - name: Detect project settings
-        id: detect
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ ! -f package.json ]]; then
-            echo "::error::package.json is missing. This workflow expects a Node-based web project."
-            exit 1
-          fi
-
-          if [[ -f pnpm-lock.yaml ]]; then
-            PM=pnpm
-            LOCK=yes
-          elif [[ -f yarn.lock ]]; then
-            PM=yarn
-            LOCK=yes
-          elif [[ -f package-lock.json ]]; then
-            PM=npm
-            LOCK=yes
-          else
-            PM=npm
-            LOCK=no
-            echo "::warning::No package lock found; dependency installation may be less reproducible."
-          fi
-
-          # Vite default output is dist. Override by setting MOBILE_WEB_DIR in the workflow
-          # environment if this project uses a different output directory.
-          WEB_DIR="${MOBILE_WEB_DIR:-dist}"
-          echo "package_manager=$PM" >> "$GITHUB_OUTPUT"
-          echo "has_lock=$LOCK" >> "$GITHUB_OUTPUT"
-          echo "web_dir=$WEB_DIR" >> "$GITHUB_OUTPUT"
-          echo "Detected package manager: $PM"
-          echo "Lockfile found: $LOCK"
-          echo "Expected web output directory: $WEB_DIR"
-          echo "package.json preview:"
-          cat package.json
-
-  build-android:
-    name: Android APK (independent build)
-    runs-on: ubuntu-latest
-    needs: prepare
-    if: always() && needs.prepare.result == 'success'
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+          echo "package.json:"
+          if [[ -f package.json ]]; then cat package.json; else echo "::error::package.json is missing"; exit 1; fi
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      - name: Print Android runner diagnostics
-        shell: bash
-        run: |
-          set -euxo pipefail
-          echo "=== Android build diagnostics ==="
-          uname -a
-          df -h
-          free -h || true
-          node --version
-          npm --version
-          java -version
-          echo "GitHub Actions runner image:"
-          cat /etc/os-release
-
       - name: Install dependencies
         id: deps
         shell: bash
         run: |
           set -euxo pipefail
-          PM="${{ needs.prepare.outputs.package_manager }}"
-          echo "Package manager selected: $PM"
-          if [[ "$PM" == "pnpm" ]]; then
+          if [[ -f package-lock.json ]]; then
+            npm ci
+          elif [[ -f pnpm-lock.yaml ]]; then
             corepack enable
             pnpm install --frozen-lockfile
-          elif [[ "$PM" == "yarn" ]]; then
+          elif [[ -f yarn.lock ]]; then
             corepack enable
             yarn install --immutable || yarn install --frozen-lockfile
-          elif [[ -f package-lock.json ]]; then
-            npm ci
           else
+            echo "::warning::No lockfile found; using npm install."
             npm install
           fi
         continue-on-error: true
 
-      - name: Stop if dependency installation failed
+      - name: Report dependency installation failure
         if: steps.deps.outcome != 'success'
-        shell: bash
         run: |
-          echo "::error::Dependency installation failed for Android. See the preceding install logs for the exact npm/pnpm/yarn error."
+          echo "::error::Dependency installation failed. Review the npm/pnpm/yarn output above."
           exit 1
 
-      - name: Install Capacitor packages
+      - name: Install Capacitor
         id: capdeps
-        run: |
-          set -euxo pipefail
-          npm install @capacitor/core @capacitor/cli @capacitor/android
+        run: npm install @capacitor/core @capacitor/cli @capacitor/android
         continue-on-error: true
 
-      - name: Stop if Capacitor installation failed
+      - name: Report Capacitor installation failure
         if: steps.capdeps.outcome != 'success'
         run: |
-          echo "::error::Could not install Capacitor packages for Android."
+          echo "::error::Capacitor installation failed."
           exit 1
 
-      - name: Build web application
+      - name: Build web app and check output
         id: webbuild
         shell: bash
         run: |
           set -euxo pipefail
-          echo "Running project build script..."
           npm run build
-          WEB_DIR="${{ needs.prepare.outputs.web_dir }}"
-          echo "Checking web output directory: $WEB_DIR"
-          if [[ ! -d "$WEB_DIR" ]]; then
-            echo "::error::Build completed but '$WEB_DIR' does not exist. Check the build script and set MOBILE_WEB_DIR if the output folder is different."
-            echo "Directories at workspace root:"
-            find . -maxdepth 2 -type d -print
-            exit 1
-          fi
-          echo "Built files:"
-          find "$WEB_DIR" -maxdepth 3 -type f -print
+          WEB_DIR="${MOBILE_WEB_DIR:-dist}"
+          echo "Checking output directory: $WEB_DIR"
           if [[ ! -f "$WEB_DIR/index.html" ]]; then
-            echo "::error::'$WEB_DIR/index.html' is missing. A web app entry point is required."
+            echo "::error::Missing $WEB_DIR/index.html. Check the build script or update WEB_DIR in this workflow."
+            find . -maxdepth 3 -type d -print
             exit 1
           fi
+          echo "Web output files:"
+          find "$WEB_DIR" -maxdepth 3 -type f -print
         continue-on-error: true
 
-      - name: Stop if web build failed
+      - name: Report web build failure
         if: steps.webbuild.outcome != 'success'
         run: |
-          echo "::error::Web build failed. Android packaging cannot continue."
+          echo "::error::Web build failed; Android packaging is stopped."
           exit 1
 
-      - name: Configure Capacitor
+      - name: Create and sync Android project
         id: capconfig
         shell: bash
         run: |
           set -euxo pipefail
-          WEB_DIR="${{ needs.prepare.outputs.web_dir }}"
+          WEB_DIR="${MOBILE_WEB_DIR:-dist}"
           cat > capacitor.config.json <<EOF
           {
             "appId": "fr.tatiana.termescape",
@@ -189,20 +112,16 @@ jobs:
             "bundledWebRuntime": false
           }
           EOF
-          echo "Generated capacitor.config.json:"
           cat capacitor.config.json
-          if [[ ! -d android ]]; then
-            npx cap add android
-          fi
+          if [[ ! -d android ]]; then npx cap add android; fi
           npx cap sync android
-          echo "Android project files:"
-          find android -maxdepth 3 -type f | sort | head -250
+          find android -maxdepth 3 -type f -print | sort | head -200
         continue-on-error: true
 
-      - name: Stop if Capacitor Android setup failed
+      - name: Report Android setup failure
         if: steps.capconfig.outcome != 'success'
         run: |
-          echo "::error::Capacitor failed to create or synchronize the Android project."
+          echo "::error::Capacitor could not create or sync the Android project."
           exit 1
 
       - name: Set up Java
@@ -219,16 +138,14 @@ jobs:
           set -euxo pipefail
           cd android
           chmod +x gradlew
-          echo "Gradle version:"
           ./gradlew --version
-          echo "Building debug APK. This does not require a Play Store signing key."
           ./gradlew --no-daemon --stacktrace --info assembleDebug
-          echo "APK files produced:"
+          echo "APK output files:"
           find app/build/outputs/apk -type f -name '*.apk' -print
           test -f app/build/outputs/apk/debug/app-debug.apk
         continue-on-error: true
 
-      - name: Upload APK artifact
+      - name: Upload APK
         if: steps.apkbuild.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
@@ -237,117 +154,107 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Record Android failure details
+      - name: Print Android failure diagnostics
         if: always() && steps.apkbuild.outcome != 'success'
         shell: bash
         run: |
-          echo "::error::Android APK build failed. Review the Gradle --stacktrace --info output above."
-          echo "Potential causes: incompatible Gradle/JDK versions, plugin configuration, missing web assets, or an Android project configuration error."
-          echo "Workspace snapshot:"
-          ls -la
-          echo "Android output folders:"
-          find android -maxdepth 6 -type d \( -name build -o -name outputs -o -name reports \) -print 2>/dev/null || true
-          echo "Gradle reports:"
-          find android -type f \( -name '*.html' -o -name '*.txt' \) -path '*reports*' -print 2>/dev/null || true
+          echo "::error::APK build failed. Read the Gradle error and stack trace above."
+          find android -maxdepth 7 -type d \( -name build -o -name reports -o -name outputs \) -print 2>/dev/null || true
           exit 1
 
   build-ios:
-    name: iOS IPA (independent build)
+    name: Build iOS IPA
     runs-on: macos-latest
-    needs: prepare
-    if: always() && needs.prepare.result == 'success'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Show environment diagnostics
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "=== iOS diagnostics ==="
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Commit: $GITHUB_SHA"
+          sw_vers
+          uname -a
+          df -h
+          xcodebuild -version
+          xcodebuild -showsdks
+          echo "Root files:"
+          ls -la
+          if [[ ! -f package.json ]]; then echo "::error::package.json is missing"; exit 1; fi
+          cat package.json
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      - name: Print iOS runner diagnostics
-        shell: bash
-        run: |
-          set -euxo pipefail
-          echo "=== iOS build diagnostics ==="
-          sw_vers
-          uname -a
-          df -h
-          node --version
-          npm --version
-          xcodebuild -version
-          xcodebuild -showsdks
-          echo "Available Xcode installations:"
-          ls -la /Applications | grep -i Xcode || true
-
       - name: Install dependencies
         id: deps
         shell: bash
         run: |
           set -euxo pipefail
-          PM="${{ needs.prepare.outputs.package_manager }}"
-          echo "Package manager selected: $PM"
-          if [[ "$PM" == "pnpm" ]]; then
+          if [[ -f package-lock.json ]]; then
+            npm ci
+          elif [[ -f pnpm-lock.yaml ]]; then
             corepack enable
             pnpm install --frozen-lockfile
-          elif [[ "$PM" == "yarn" ]]; then
+          elif [[ -f yarn.lock ]]; then
             corepack enable
             yarn install --immutable || yarn install --frozen-lockfile
-          elif [[ -f package-lock.json ]]; then
-            npm ci
           else
+            echo "::warning::No lockfile found; using npm install."
             npm install
           fi
         continue-on-error: true
 
-      - name: Stop if dependency installation failed
+      - name: Report dependency installation failure
         if: steps.deps.outcome != 'success'
         run: |
-          echo "::error::Dependency installation failed for iOS. See the preceding install logs."
+          echo "::error::Dependency installation failed. Review the package manager output above."
           exit 1
 
-      - name: Install Capacitor packages
+      - name: Install Capacitor
         id: capdeps
-        run: |
-          set -euxo pipefail
-          npm install @capacitor/core @capacitor/cli @capacitor/ios
+        run: npm install @capacitor/core @capacitor/cli @capacitor/ios
         continue-on-error: true
 
-      - name: Stop if Capacitor installation failed
+      - name: Report Capacitor installation failure
         if: steps.capdeps.outcome != 'success'
         run: |
-          echo "::error::Could not install Capacitor packages for iOS."
+          echo "::error::Capacitor installation failed."
           exit 1
 
-      - name: Build web application
+      - name: Build web app and check output
         id: webbuild
         shell: bash
         run: |
           set -euxo pipefail
           npm run build
-          WEB_DIR="${{ needs.prepare.outputs.web_dir }}"
-          echo "Expected output directory: $WEB_DIR"
-          if [[ ! -d "$WEB_DIR" || ! -f "$WEB_DIR/index.html" ]]; then
-            echo "::error::Web output '$WEB_DIR/index.html' is missing. Check the build script and MOBILE_WEB_DIR."
+          WEB_DIR="${MOBILE_WEB_DIR:-dist}"
+          if [[ ! -f "$WEB_DIR/index.html" ]]; then
+            echo "::error::Missing $WEB_DIR/index.html. Check the build script or update WEB_DIR in this workflow."
             find . -maxdepth 3 -type d -print
             exit 1
           fi
-          echo "Built web files:"
+          echo "Web output files:"
           find "$WEB_DIR" -maxdepth 3 -type f -print
         continue-on-error: true
 
-      - name: Stop if web build failed
+      - name: Report web build failure
         if: steps.webbuild.outcome != 'success'
         run: |
-          echo "::error::Web build failed. iOS packaging cannot continue."
+          echo "::error::Web build failed; iOS packaging is stopped."
           exit 1
 
-      - name: Configure Capacitor
+      - name: Create and sync iOS project
         id: capconfig
         shell: bash
         run: |
           set -euxo pipefail
-          WEB_DIR="${{ needs.prepare.outputs.web_dir }}"
+          WEB_DIR="${MOBILE_WEB_DIR:-dist}"
           cat > capacitor.config.json <<EOF
           {
             "appId": "fr.tatiana.termescape",
@@ -356,20 +263,16 @@ jobs:
             "bundledWebRuntime": false
           }
           EOF
-          echo "Generated capacitor.config.json:"
           cat capacitor.config.json
-          if [[ ! -d ios ]]; then
-            npx cap add ios
-          fi
+          if [[ ! -d ios ]]; then npx cap add ios; fi
           npx cap sync ios
-          echo "iOS project files:"
           find ios -maxdepth 4 -type f -print | sort | head -250
         continue-on-error: true
 
-      - name: Stop if Capacitor iOS setup failed
+      - name: Report iOS setup failure
         if: steps.capconfig.outcome != 'success'
         run: |
-          echo "::error::Capacitor failed to create or synchronize the iOS project."
+          echo "::error::Capacitor could not create or sync the iOS project."
           exit 1
 
       - name: Build unsigned iOS app
@@ -377,7 +280,6 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          echo "Available Xcode schemes:"
           xcodebuild -list -project ios/App/App.xcodeproj
           xcodebuild \
             -project ios/App/App.xcodeproj \
@@ -389,17 +291,11 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_IDENTITY="" \
-            -verbose \
-            build
+            -verbose build
           APP_PATH="$PWD/build/ios/Build/Products/Release-iphoneos/App.app"
-          echo "Expected app bundle: $APP_PATH"
-          if [[ ! -d "$APP_PATH" ]]; then
-            echo "::error::Xcode reported success but App.app was not found."
-            find build/ios -maxdepth 8 -print || true
-            exit 1
-          fi
-          echo "Built app bundle contents:"
-          find "$APP_PATH" -maxdepth 3 -print | head -300
+          test -d "$APP_PATH"
+          echo "Built app files:"
+          find "$APP_PATH" -maxdepth 3 -print | head -250
         continue-on-error: true
 
       - name: Package unsigned IPA
@@ -412,16 +308,13 @@ jobs:
           mkdir -p ipa/Payload
           ditto "$APP_PATH" ipa/Payload/App.app
           (cd ipa && /usr/bin/zip -r ../termEscape-unsigned.ipa Payload)
-          echo "IPA details:"
           ls -lh termEscape-unsigned.ipa
-          echo "IPA archive integrity:"
           unzip -t termEscape-unsigned.ipa
-          echo "IPA contents:"
           unzip -l termEscape-unsigned.ipa | head -200
           test -s termEscape-unsigned.ipa
         continue-on-error: true
 
-      - name: Upload IPA artifact
+      - name: Upload IPA
         if: steps.ipapackage.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
@@ -430,46 +323,36 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Record iOS failure details
+      - name: Print iOS failure diagnostics
         if: always() && (steps.iosbuild.outcome != 'success' || steps.ipapackage.outcome != 'success')
         shell: bash
         run: |
-          echo "::error::iOS IPA generation failed. Review the Xcode output above for the first actual error."
-          echo "An unsigned IPA is only a build artifact and normally cannot be installed directly on a standard iPhone without signing/provisioning."
-          echo "Xcode build logs and products:"
-          find build/ios -maxdepth 6 -print 2>/dev/null | head -500 || true
-          echo "iOS project and reports:"
+          echo "::error::IPA build or packaging failed. Inspect the first Xcode error above."
+          echo "An unsigned IPA requires Apple signing/provisioning for normal installation on an iPhone."
+          find build/ios -maxdepth 6 -print 2>/dev/null | head -400 || true
           find ios -maxdepth 7 -type d \( -name '*.xcresult' -o -name Reports -o -name Logs \) -print 2>/dev/null || true
           exit 1
 
   summary:
-    name: Build summary
+    name: Final build summary
     runs-on: ubuntu-latest
     if: always()
-    needs: [prepare, build-android, build-ios]
+    needs:
+      - build-android
+      - build-ios
     steps:
-      - name: Print final status and artifact availability
+      - name: Print platform results
         shell: bash
         run: |
           echo "================ termEscape build summary ================"
-          echo "Repository: $GITHUB_REPOSITORY"
-          echo "Commit: $GITHUB_SHA"
-          echo "Android job result: ${{ needs.build-android.result }}"
-          echo "iOS job result: ${{ needs.build-ios.result }}"
-          echo
-          echo "Artifacts are uploaded independently by each successful platform job:"
-          echo "- Android success => termEscape-android-apk"
-          echo "- iOS app + IPA packaging success => termEscape-ios-ipa-unsigned"
-          echo "- Both succeed => both artifacts should be available."
-          echo "- One succeeds => that platform's artifact remains available even if the other fails."
-          echo "- Both fail => no application artifact is expected; inspect the failed job logs."
-          echo
-          echo "Note: The iOS artifact is unsigned and requires appropriate Apple signing for normal device installation."
-          if [[ "${{ needs.build-android.result }}" != "success" && "${{ needs.build-ios.result }}" != "success" ]]; then
-            echo "::error::Both platform jobs failed or were not completed successfully. Open each job and locate the first error above the final failure summary."
-            exit 1
-          elif [[ "${{ needs.build-android.result }}" != "success" || "${{ needs.build-ios.result }}" != "success" ]]; then
-            echo "::warning::Only one platform completed successfully. Download its artifact and inspect the failed platform's logs."
+          echo "Android job: ${{ needs.build-android.result }}"
+          echo "iOS job: ${{ needs.build-ios.result }}"
+          echo "Android success publishes: termEscape-android-apk"
+          echo "iOS success publishes: termEscape-ios-ipa-unsigned"
+          echo "Both succeed = both artifacts; one succeeds = that artifact remains available."
+          if [[ "${{ needs.build-android.result }}" == "success" || "${{ needs.build-ios.result }}" == "success" ]]; then
+            echo "At least one platform succeeded. Download the artifact(s) from this workflow run."
           else
-            echo "Both platform jobs completed successfully."
+            echo "::error::Both platform builds failed. Open both jobs and inspect the first error in each log."
+            exit 1
           fi
